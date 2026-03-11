@@ -1,58 +1,157 @@
 """
-/api/upload — receives the CSV/XLSX file + recipient email,
-orchestrates parsing → AI analysis → email delivery.
+routers/upload.py
+─────────────────
+Defines the POST /api/upload endpoint.
+
+Responsibilities of THIS file (router layer):
+  - Accept and validate the HTTP request (file + email).
+  - Delegate all business logic to services.
+  - Shape the HTTP response.
+
+The router intentionally contains NO business logic.
 """
 import io
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from pydantic import EmailStr
 
-from app.utils.file_parser import parse_sales_file
+from app.models.schemas import UploadResponse
 from app.services.ai_service import generate_summary
 from app.services.email_service import send_summary_email
-from app.models.schemas import UploadResponse
+from app.utils.file_parser import parse_sales_file
 
 router = APIRouter()
+
+# Permitted MIME types for uploaded sales files
+_ALLOWED_CONTENT_TYPES = {
+    "text/csv",
+    "application/vnd.ms-excel",                                          # .xls
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", # .xlsx
+}
+
+# Permitted file extensions (belt-and-suspenders check alongside MIME type)
+_ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
 
 @router.post(
     "/upload",
     response_model=UploadResponse,
-    summary="Upload sales file and trigger AI summary email",
+    status_code=status.HTTP_200_OK,
+    summary="Upload a sales file and receive an AI summary by email",
+    response_description="Confirmation that the email was sent successfully",
+    responses={
+        400: {"description": "Invalid file type"},
+        422: {"description": "File is empty or cannot be parsed"},
+        500: {"description": "AI or email service failure"},
+    },
 )
 async def upload_sales_file(
-    file: UploadFile = File(..., description="CSV or XLSX sales data file"),
-    email: EmailStr = Form(..., description="Recipient email address"),
-):
-    # ── 1. Validate file type ────────────────────────────────────────────────
-    allowed = {"text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Only CSV or XLSX files are accepted.")
+    file: UploadFile = File(
+        ...,
+        description="Sales data file (.csv or .xlsx, max ~10 MB)",
+    ),
+    email: EmailStr = Form(
+        ...,
+        description="Email address where the summary will be delivered",
+    ),
+) -> UploadResponse:
+    """
+    **Upload flow:**
 
-    contents = await file.read()
+    1. Validates file type (MIME + extension).
+    2. Parses the CSV/XLSX into structured sales data.
+    3. Sends data to Gemini to generate a professional executive summary.
+    4. Emails the summary to the provided address.
+    5. Returns a success JSON response.
+    """
 
-    # ── 2. Parse into a DataFrame ────────────────────────────────────────────
+    # ── Step 1: Validate file type ───────────────────────────────────────────
+    _validate_file_type(file)
+
+    # ── Step 2: Read file bytes ──────────────────────────────────────────────
     try:
-        df = parse_sales_file(io.BytesIO(contents), file.filename)
+        raw_bytes = await file.read()
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to read uploaded file: {exc}",
+        )
 
-    if df.empty:
-        raise HTTPException(status_code=422, detail="The uploaded file contains no data rows.")
-
-    # ── 3. Generate AI summary ───────────────────────────────────────────────
+    # ── Step 3: Parse into structured data ──────────────────────────────────
     try:
-        summary = await generate_summary(df)
+        sales_data = parse_sales_file(io.BytesIO(raw_bytes), file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI service error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Could not parse the file. Make sure it is valid. ({exc})",
+        )
 
-    # ── 4. Send email ────────────────────────────────────────────────────────
+    # ── Step 4: Generate AI summary ──────────────────────────────────────────
     try:
-        await send_summary_email(recipient=email, summary=summary)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Email service error: {exc}")
+        summary = await generate_summary(sales_data)
+    except EnvironmentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"AI service error: {exc}",
+        )
 
+    # ── Step 5: Send email ───────────────────────────────────────────────────
+    try:
+        await send_summary_email(
+            recipient=str(email),
+            summary=summary,
+            rows_analyzed=sales_data.row_count,
+        )
+    except EnvironmentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Email delivery failed: {exc}",
+        )
+
+    # ── Step 6: Return success ───────────────────────────────────────────────
     return UploadResponse(
-        message="Summary generated and sent successfully!",
+        status="success",
+        message="Summary generated and email sent",
+        rows_analyzed=sales_data.row_count,
         recipient=email,
-        rows_analyzed=len(df),
     )
+
+
+# ── Validation helpers ─────────────────────────────────────────────────────────
+
+def _validate_file_type(file: UploadFile) -> None:
+    """
+    Raise HTTP 400 if the file is not an accepted CSV or Excel file.
+    We check both MIME type and file extension for robustness,
+    because browsers sometimes send incorrect content-type headers.
+    """
+    content_type = (file.content_type or "").lower()
+    filename = file.filename or ""
+    extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    mime_ok = content_type in _ALLOWED_CONTENT_TYPES
+    ext_ok = extension in _ALLOWED_EXTENSIONS
+
+    if not mime_ok and not ext_ok:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid file type '{filename}'. "
+                "Only .csv and .xlsx files are accepted."
+            ),
+        )

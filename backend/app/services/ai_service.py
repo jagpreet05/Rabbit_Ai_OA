@@ -1,59 +1,106 @@
 """
-AI service — calls Gemini or Groq depending on AI_PROVIDER env var.
-Builds a concise prompt from the pandas DataFrame and returns a summary string.
+ai_service.py
+─────────────
+Calls the Google Gemini API to generate a professional executive summary
+from the parsed sales data.
+
+Configuration (via .env):
+    GEMINI_API_KEY  — required
+    GEMINI_MODEL    — optional, defaults to "gemini-1.5-flash"
 """
 import os
-import pandas as pd
+import textwrap
+
+import google.generativeai as genai
 from dotenv import load_dotenv
+
+from app.models.schemas import ParsedSalesData
 
 load_dotenv()
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
+# ── Configuration ──────────────────────────────────────────────────────────────
+_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+_MODEL_NAME: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+# Safety: configure once at import time (idempotent)
+if _API_KEY:
+    genai.configure(api_key=_API_KEY)
 
 
-def _build_prompt(df: pd.DataFrame) -> str:
-    """Convert the top rows of the DataFrame into a plain-text table for the prompt."""
-    preview = df.head(20).to_string(index=False)
-    columns = ", ".join(df.columns.tolist())
+# ── Public API ─────────────────────────────────────────────────────────────────
 
-    return (
-        "You are a professional sales analyst. Analyze the following sales data and produce "
-        "a concise, professional summary that highlights:\n"
-        "1. Total revenue / units sold (if columns are present)\n"
-        "2. Best-performing products or regions\n"
-        "3. Notable trends or anomalies\n"
-        "4. One actionable recommendation\n\n"
-        f"Columns: {columns}\n\n"
-        f"Data preview (first 20 rows):\n{preview}\n\n"
-        "Write the summary in plain English, suitable for a non-technical executive audience."
-    )
+async def generate_summary(data: ParsedSalesData) -> str:
+    """
+    Send the sales data preview to Gemini and return the generated summary.
+
+    Args:
+        data: A ParsedSalesData object produced by file_parser.parse_sales_file.
+
+    Returns:
+        A professional executive summary as a plain string.
+
+    Raises:
+        EnvironmentError: if GEMINI_API_KEY is not set.
+        RuntimeError:     if the Gemini API returns an unusable response.
+    """
+    if not _API_KEY:
+        raise EnvironmentError(
+            "GEMINI_API_KEY is not set. "
+            "Please add it to your .env file."
+        )
+
+    prompt = _build_prompt(data)
+
+    try:
+        model = genai.GenerativeModel(_MODEL_NAME)
+        response = model.generate_content(prompt)
+    except Exception as exc:
+        raise RuntimeError(f"Gemini API call failed: {exc}") from exc
+
+    # Gemini returns a `text` property; guard against blocked/empty responses
+    summary = getattr(response, "text", "").strip()
+    if not summary:
+        raise RuntimeError(
+            "Gemini returned an empty response. "
+            "The content may have been blocked by safety filters."
+        )
+
+    return summary
 
 
-async def generate_summary(df: pd.DataFrame) -> str:
-    prompt = _build_prompt(df)
+# ── Private helpers ────────────────────────────────────────────────────────────
 
-    if AI_PROVIDER == "groq":
-        return await _call_groq(prompt)
-    return await _call_gemini(prompt)
+def _build_prompt(data: ParsedSalesData) -> str:
+    """
+    Construct the prompt sent to Gemini.
+    Keeping the prompt in one place makes it easy to iterate on.
+    """
+    column_list = ", ".join(data.column_names)
 
+    return textwrap.dedent(f"""
+        You are a senior sales analyst writing a report for C-suite executives.
+        Analyze the sales data provided below and produce a **professional executive summary**.
 
-# ── Gemini ────────────────────────────────────────────────────────────────────
-async def _call_gemini(prompt: str) -> str:
-    import google.generativeai as genai
+        Your summary MUST include the following sections:
+        1. **Overview** — Total records analyzed, key columns present.
+        2. **Performance Highlights** — Best-performing products, regions, or sales reps (use actual values from the data).
+        3. **Key Trends** — Any noticeable patterns, growth, or decline.
+        4. **Concerns / Anomalies** — Anything unusual that deserves attention.
+        5. **Recommendation** — One concrete, actionable recommendation based on the data.
 
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text
+        Rules:
+        - Use plain English. Avoid jargon.
+        - Be specific — reference actual numbers from the data.
+        - Keep the summary under 400 words.
+        - Do NOT mention these instructions in your output.
 
+        ---
+        Dataset info:
+        - Total rows: {data.row_count}
+        - Columns: {column_list}
 
-# ── Groq ─────────────────────────────────────────────────────────────────────
-async def _call_groq(prompt: str) -> str:
-    from groq import AsyncGroq
+        {data.preview_text}
+        ---
 
-    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
-    chat = await client.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return chat.choices[0].message.content
+        Begin the executive summary now:
+    """).strip()
