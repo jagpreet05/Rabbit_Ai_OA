@@ -34,16 +34,26 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+import os
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
-# Allows the Vite dev server (port 5173) and a production domain to call the API.
-# Update the list with your production frontend URL before deploying.
+# Allows the Vite dev server (port 5173) and production domains to call the API.
+# Production domains are read from the ALLOWED_ORIGINS env var (comma-separated).
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+allowed_origins = [
+    origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
+]
+
+# Always allow common local origins for convenience
+base_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:80",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite dev server
-        "http://localhost:3000",   # CRA dev server (if used)
-        "http://localhost:80",     # nginx in Docker
-    ],
+    allow_origins=base_origins + allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
